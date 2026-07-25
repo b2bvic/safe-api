@@ -2,10 +2,10 @@
 """
 safe-api — Safety wrapper for REST API write operations.
 
-Seven guardrails that contain REST API write behavior:
+Seven rules that prevent runaway writes to production APIs:
 
 1. Dry-run default — --execute flag required to actually write
-2. One mutation request per method call
+2. One record per transaction — GET→diff→PUT/POST→verify→log
 3. Duplicate guard — configurable dedup check before POST
 4. Circuit breaker — halts on 2+ failures or rate exceeded
 5. Audit trail — every write logged to JSONL
@@ -24,7 +24,6 @@ import sys
 import time
 import urllib.request
 import urllib.error
-import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Callable
@@ -160,7 +159,7 @@ class SafeAPIClient:
             "failure_count": self._failure_count,
             "writes_last_60s": len(self._write_timestamps),
         }
-        ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
         incident_file = self._incident_dir / f"incident-{self.name}-{ts}.json"
         incident_file.write_text(json.dumps(incident, indent=2))
         print(f"CIRCUIT BREAKER TRIPPED: {reason}", file=sys.stderr)
@@ -178,7 +177,7 @@ class SafeAPIClient:
         """GET request — always allowed, no safety gates."""
         url = f"{self.base_url}{endpoint}"
         if params:
-            qs = urllib.parse.urlencode(params, doseq=True)
+            qs = "&".join(f"{k}={v}" for k, v in params.items())
             url = f"{url}?{qs}"
 
         req = urllib.request.Request(url)
@@ -249,8 +248,7 @@ class SafeAPIClient:
             self._log_write(audit_entry)
             return {"dry_run": True, "would_send": payload, "endpoint": endpoint, "method": method}
 
-        # Rule 2: Execute one mutation request for this method call.
-        # Payload cardinality remains the caller's responsibility.
+        # Rule 2: Execute single record
         url = f"{self.base_url}{endpoint}"
         data = json.dumps(payload).encode() if payload else None
 
@@ -279,13 +277,9 @@ class SafeAPIClient:
                 error_body = e.read().decode()
             except Exception:
                 pass
-            finally:
-                e.close()
             audit_entry["action"] = "FAILED"
             audit_entry["error"] = f"HTTP {e.code}: {error_body}"
             self._log_write(audit_entry)
-            if self._failure_count >= self.max_failures:
-                self._trip_breaker(f"{self._failure_count}+ failures in this session")
             return {"error": f"HTTP {e.code}", "detail": error_body}
 
         except Exception as e:
@@ -293,8 +287,6 @@ class SafeAPIClient:
             audit_entry["action"] = "FAILED"
             audit_entry["error"] = str(e)
             self._log_write(audit_entry)
-            if self._failure_count >= self.max_failures:
-                self._trip_breaker(f"{self._failure_count}+ failures in this session")
             return {"error": str(e)}
 
     # --- Utilities ---

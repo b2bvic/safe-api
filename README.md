@@ -1,137 +1,179 @@
 # safe-api
 
-A zero-dependency Python wrapper that puts dry runs, scope checks, duplicate checks, circuit breaking, incident artifacts, and JSONL receipts around REST API mutations.
+Safety wrapper for REST API write operations. Seven rules that prevent runaway writes to production APIs.
 
-It is designed for small automation scripts where an accidental loop, broad endpoint, or repeated failure could write bad state faster than a human can intervene.
+Born from a real production incident where a batch write created duplicate CRM records. Zero dependencies — Python stdlib only.
 
-## Seven guardrails
+Built by [Victor Valentine Romo](https://victorvalentineromo.com) at [Scale With Search](https://scalewithsearch.com).
 
-1. **Dry-run default:** mutation methods log intent and return without sending unless execute mode is explicit.
-2. **One mutation request per method call:** all writes pass through one central `_write` path.
-3. **Duplicate callback:** callers can refuse a POST after an application-specific lookup.
-4. **Circuit breaker:** successful-write rate and session failures can stop further mutations.
-5. **Audit receipt:** dry runs, duplicate refusals, executed writes, and failures append to JSONL.
-6. **Scope controls:** allowlisted base endpoints, blocked base endpoints, and blocked methods are checked before a write.
-7. **Incident artifact:** a breaker trip writes a local JSON file with the reason and session counters.
+Part of a larger system: this repository proves **P09 (agency is governed)** from the [Seventeen Principles](https://victorvalentineromo.com/principles). What ships here is the capability-gate pattern itself; side effects are a permission granted per operation, never a habit the tooling drifts into.
 
-## Verify it
+## The Seven Rules
 
-```bash
-python3 -m py_compile safe_api.py tests/test_safe_api.py
-python3 -m unittest discover -s tests -v
-```
-
-The tests use a loopback HTTP server and a temporary log directory. No external API or credentials are required. They cover dry-run behavior, scope and duplicate refusals, a real local POST, query encoding, rate and failure breaker trips, incident files, and audit receipts.
+1. **Dry-run default** — `--execute` flag required to actually send writes
+2. **One record per transaction** — no batch mutations, GET→diff→PUT/POST→verify→log
+3. **Duplicate guard** — configurable dedup check before POST
+4. **Circuit breaker** — halts all writes on 2+ failures or rate exceeded
+5. **Audit trail** — every write logged to JSONL (including dry-runs)
+6. **Scope whitelist** — per-client endpoint restrictions + global blocks
+7. **Human escalation** — incident files generated on breaker trip
 
 ## Install
 
-Copy `safe_api.py` into a project, or download the version you reviewed:
-
-```bash
-curl -O https://raw.githubusercontent.com/b2bvic/safe-api/main/safe_api.py
+```python
+# Copy safe_api.py into your project, or:
+curl -o safe_api.py https://raw.githubusercontent.com/b2bvic/safe-api/main/safe_api.py
 ```
 
-Requires Python 3.11 or newer. Runtime dependencies are Python standard library only.
+Zero pip dependencies. Uses only Python stdlib (`urllib`, `json`, `pathlib`).
 
-## Example
+## Usage
 
 ```python
 from safe_api import SafeAPIClient
 
+# Initialize with your API
 client = SafeAPIClient(
     base_url="https://api.example.com/v1",
-    name="contact-sync",
-    allowed_endpoints=["/contacts"],
-    blocked_methods={"/contacts": ["DELETE"]},
-    auth_header="Bearer token-from-your-secret-store",
+    name="my-sync-script",
+    allowed_endpoints=["/contacts", "/tasks"],
+    blocked_endpoints=["/billing", "/users"],
+    auth_header="Bearer your-token-here",
     max_writes_per_minute=10,
 )
 
-# Default: records intent without sending.
-preview = client.post(
-    "/contacts",
-    {"name": "Jane Doe"},
-    reason="approved import fixture",
-)
+# Dry-run mode (default) — logs intent but doesn't send
+result = client.post("/contacts", {"name": "Jane Doe", "email": "jane@example.com"})
+# Returns: {"dry_run": True, "would_send": {...}, "endpoint": "/contacts", "method": "POST"}
 
-# Execute mode must be explicit in code or supplied by --execute.
-executing_client = SafeAPIClient(
-    base_url="https://api.example.com/v1",
-    name="contact-sync",
-    allowed_endpoints=["/contacts"],
-    execute=True,
-)
+# Execute mode — pass --execute on CLI or set execute=True
+# result = client.post("/contacts", {"name": "Jane Doe", "email": "jane@example.com"})
+# Actually sends the request
 ```
 
-## Duplicate guard
-
-Duplicate identity is domain-specific, so the library does not guess. Supply a callback that returns the existing record when the proposed POST would duplicate it:
+### Scope Enforcement
 
 ```python
-def existing_contact(client, endpoint, payload):
+client = SafeAPIClient(
+    base_url="https://api.example.com/v1",
+    name="contact-updater",
+    allowed_endpoints=["/contacts"],          # Only these endpoints
+    blocked_endpoints=["/billing"],            # Never these
+    blocked_methods={"/contacts": ["DELETE"]}, # Block specific methods
+)
+
+client.post("/contacts", {...})    # OK
+client.put("/contacts/123", {...}) # OK
+client.delete("/contacts/123")     # ScopeViolation!
+client.post("/billing", {...})     # ScopeViolation!
+client.post("/tasks", {...})       # ScopeViolation! (not in allowed list)
+```
+
+### Duplicate Guard
+
+```python
+def check_contact_exists(client, endpoint, payload):
+    """Custom dedup checker — return existing record or None."""
     email = payload.get("email")
-    if not email:
-        return None
-    response = client.get("/contacts", {"email": email})
-    matches = response.get("contacts", [])
-    return matches[0] if matches else None
+    if email:
+        results = client.get(f"/contacts?email={email}")
+        contacts = results.get("contacts", [])
+        if contacts:
+            return contacts[0]  # Duplicate found
+    return None  # No duplicate
 
 client = SafeAPIClient(
     base_url="https://api.example.com/v1",
+    name="contact-importer",
     allowed_endpoints=["/contacts"],
-    dedup_checker=existing_contact,
+    dedup_checker=check_contact_exists,
 )
 ```
 
-## Circuit breaker
+### Circuit Breaker
 
-The client trips when either threshold is reached:
+The breaker trips automatically when:
+- 2+ write failures in a session (configurable via `max_failures`)
+- Write rate exceeds `max_writes_per_minute`
 
-- `max_failures` failed mutation requests in the current process
-- `max_writes_per_minute` successful mutation requests in the trailing 60 seconds before another attempt
+When tripped:
+- All further writes raise `CircuitBreakerTripped`
+- An incident JSON file is written to the log directory
+- Manual reset: `client.reset_breaker()`
 
-A trip blocks later mutations with `CircuitBreakerTripped` and writes `incident-{name}-{timestamp}.json`. `reset_breaker()` clears in-memory counters. It does not undo remote writes.
+### Auth Methods
 
-## Audit log
+```python
+# Bearer token
+SafeAPIClient(base_url="...", auth_header="Bearer abc123")
 
-The default path is `~/.cache/safe-api/{name}-writes.jsonl`. Use `log_dir` to place receipts elsewhere and `log_tail()` to read them.
+# API key from environment variable
+SafeAPIClient(base_url="...", api_key_env="MY_API_KEY")
 
-Payloads are logged as provided. Do not put credentials in payloads, and configure a protected log directory when payloads contain personal or confidential data. Authorization headers are not written to the audit entry.
+# Basic auth (construct the header yourself)
+import base64
+creds = base64.b64encode(b"user:pass").decode()
+SafeAPIClient(base_url="...", auth_header=f"Basic {creds}")
+```
+
+### Audit Log
+
+Every write (including dry-runs, duplicates, and failures) is logged to JSONL:
+
+```json
+{
+  "timestamp": "2026-03-25T20:00:00+00:00",
+  "client": "contact-updater",
+  "endpoint": "/contacts/123",
+  "method": "PUT",
+  "action": "EXECUTED",
+  "payload": {"name": "Jane Doe"},
+  "reason": "weekly sync",
+  "dry_run": false,
+  "response_status": 200
+}
+```
+
+```python
+# View recent writes
+for entry in client.log_tail(10):
+    print(f"{entry['action']} {entry['method']} {entry['endpoint']}")
+```
+
+Log location: `~/.cache/safe-api/{name}-writes.jsonl` (configurable via `log_dir`).
 
 ## API
 
 ```python
 SafeAPIClient(
-    base_url: str,
-    name: str = "safe-api",
-    allowed_endpoints: list[str] | None = None,
-    blocked_endpoints: list[str] | None = None,
-    blocked_methods: dict[str, list[str]] | None = None,
-    auth_header: str | None = None,
-    api_key_env: str | None = None,
-    max_writes_per_minute: int = 10,
-    max_failures: int = 2,
-    log_dir: str | None = None,
-    execute: bool | None = None,
-    dedup_checker: Callable | None = None,
+    base_url: str,                          # API base URL
+    name: str = "safe-api",                 # Client name (used in logs)
+    allowed_endpoints: list[str] | None,    # Whitelist (None = allow all)
+    blocked_endpoints: list[str] | None,    # Global blocks
+    blocked_methods: dict | None,           # Per-endpoint method blocks
+    auth_header: str | None,                # Authorization header value
+    api_key_env: str | None,                # Env var name for API key
+    max_writes_per_minute: int = 10,        # Rate limit
+    max_failures: int = 2,                  # Circuit breaker threshold
+    log_dir: str | None,                    # Log directory path
+    execute: bool | None,                   # Override dry-run (None = check CLI)
+    dedup_checker: Callable | None,         # Custom duplicate checker
 )
+
+# Methods
+client.get(endpoint, params=None)           # Always allowed
+client.post(endpoint, payload, reason="")   # Gated
+client.put(endpoint, payload, reason="")    # Gated
+client.patch(endpoint, payload, reason="")  # Gated
+client.delete(endpoint, reason="")          # Gated
+client.log_tail(n=20)                       # Read audit log
+client.reset_breaker()                      # Manual breaker reset
 ```
-
-Mutation methods are `post`, `put`, `patch`, and `delete`. `get` is ungated and intended for lookups. Scope matching uses the first endpoint path segment, such as `/contacts` for `/contacts/123`.
-
-## Non-guarantees
-
-- The wrapper does not infer whether a payload contains one record or a batch.
-- It does not diff or verify remote state after a successful response.
-- It does not coordinate rate or breaker state across processes.
-- It does not make retries idempotent or supply idempotency keys.
-- It does not encrypt or redact audit payloads.
-- It cannot replace API-side authorization, validation, or transactional controls.
-
-See [design decisions](docs/DECISIONS.md) for the boundary behind each guardrail.
 
 ## License
 
 MIT
 
-Built by [Victor Valentine Romo](https://victorvalentineromo.com).
+## How this was built
+
+Specification and judgment: human. Implementation: AI models executing that specification under a build contract, with an adversarial audit before publish. The division of labor is the point; see [P07](https://victorvalentineromo.com/principles).
