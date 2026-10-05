@@ -1,21 +1,13 @@
 #!/usr/bin/env python3
 """
-safe-api — Safety wrapper for REST API write operations.
+safe-api: Dry-run REST API write wrapper.
 
-Seven rules that prevent runaway writes to production APIs:
+Check configured endpoint scope and in-memory breaker limits before writes.
+Support an optional POST duplicate callback and local JSONL logging.
+Callers must enforce approval, define record boundaries, and verify outcomes.
+The wrapper does not implement a remote transaction or rollback.
 
-1. Dry-run default — --execute flag required to actually write
-2. One record per transaction — GET→diff→PUT/POST→verify→log
-3. Duplicate guard — configurable dedup check before POST
-4. Circuit breaker — halts on 2+ failures or rate exceeded
-5. Audit trail — every write logged to JSONL
-6. Scope whitelist — per-client endpoint restrictions + global blocks
-7. Human escalation — incident files generated on breaker trip
-
-Zero dependencies. Stdlib only. Born from a production incident where
-a batch write created duplicate records in a CRM.
-
-🌐 Victor Valentine Romo · victorvalentineromo.com · scalewithsearch.com
+Uses only the Python standard library.
 """
 
 import json
@@ -24,9 +16,10 @@ import sys
 import time
 import urllib.request
 import urllib.error
+from urllib.parse import urlsplit
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Callable
+from typing import Callable
 
 VERSION = "1.0.0"
 
@@ -43,8 +36,8 @@ class ScopeViolation(Exception):
 
 class SafeAPIClient:
     """
-    Gated REST API client. Every write operation passes through seven
-    safety rules before reaching the API.
+    REST API client with configurable local write controls.
+    Execution mode is a setting; callers must enforce human approval.
 
     Usage:
         client = SafeAPIClient(
@@ -77,7 +70,7 @@ class SafeAPIClient:
     ):
         self.base_url = base_url.rstrip("/")
         self.name = name
-        self.allowed_endpoints = frozenset(allowed_endpoints) if allowed_endpoints else None
+        self.allowed_endpoints = frozenset(allowed_endpoints) if allowed_endpoints is not None else None
         self.blocked_endpoints = frozenset(blocked_endpoints or [])
         self.blocked_methods = {k: frozenset(v) for k, v in (blocked_methods or {}).items()}
         self.max_writes_per_minute = max_writes_per_minute
@@ -120,7 +113,15 @@ class SafeAPIClient:
 
     def _validate_scope(self, endpoint: str, method: str) -> None:
         """Enforce endpoint restrictions."""
-        base = "/" + endpoint.lstrip("/").split("/")[0]
+        parsed = urlsplit(endpoint)
+        segments = parsed.path.split("/")
+        if (not endpoint.startswith("/") or parsed.scheme or parsed.netloc
+                or parsed.fragment or "\\" in endpoint or "%" in parsed.path
+                or any(part in {".", ".."} for part in segments)
+                or "//" in parsed.path
+                or any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in endpoint)):
+            raise ScopeViolation("Endpoint must be an unencoded absolute API path without traversal")
+        base = "/" + parsed.path.lstrip("/").split("/")[0]
 
         if base in self.blocked_endpoints:
             raise ScopeViolation(f"BLOCKED: {method} {endpoint} — endpoint is globally blocked")
@@ -192,19 +193,19 @@ class SafeAPIClient:
             return {"error": str(e)}
 
     def post(self, endpoint: str, payload: dict, reason: str = "") -> dict:
-        """POST — passes through all seven safety rules."""
+        """POST through the configured write controls."""
         return self._write("POST", endpoint, payload, reason)
 
     def put(self, endpoint: str, payload: dict, reason: str = "") -> dict:
-        """PUT — passes through all seven safety rules."""
+        """PUT through the configured write controls."""
         return self._write("PUT", endpoint, payload, reason)
 
     def patch(self, endpoint: str, payload: dict, reason: str = "") -> dict:
-        """PATCH — passes through all seven safety rules."""
+        """PATCH through the configured write controls."""
         return self._write("PATCH", endpoint, payload, reason)
 
     def delete(self, endpoint: str, reason: str = "") -> dict:
-        """DELETE — passes through all seven safety rules."""
+        """DELETE through the configured write controls."""
         return self._write("DELETE", endpoint, {}, reason)
 
     def _write(self, method: str, endpoint: str, payload: dict, reason: str) -> dict:
@@ -248,7 +249,7 @@ class SafeAPIClient:
             self._log_write(audit_entry)
             return {"dry_run": True, "would_send": payload, "endpoint": endpoint, "method": method}
 
-        # Rule 2: Execute single record
+        # Send one request. The caller defines record boundaries.
         url = f"{self.base_url}{endpoint}"
         data = json.dumps(payload).encode() if payload else None
 
