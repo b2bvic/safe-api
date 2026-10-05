@@ -88,6 +88,10 @@ python3 -m unittest discover -s tests -v
 - [session-ledger](https://github.com/b2bvic/session-ledger): transcript record archive.
 - [observer-protocol](https://github.com/b2bvic/observer-protocol): local draft review status.
 
+## How this was built
+
+This README was written with model assistance in 2026. The code and tests in this repository are the evidence; read them to judge the tool.
+
 ## License
 
 [MIT](LICENSE).
